@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"sync"
 )
 
 // Options controls the dump behavior.
@@ -120,6 +121,12 @@ func (ds Dumpers) DumpResponseHeader(p []byte) {
 type Dumper struct {
 	Options
 	ch chan *dumpTask
+	// mu serializes synchronous writes in DumpTo. Without it, a single Dumper
+	// shared by the HTTP/2 request-writer goroutine (DumpDefault from
+	// clientStream.writeRequest) and the response-reader goroutine
+	// (DumpResponseHeader from Framer.readMetaFrame) races on the underlying
+	// io.Writer (commonly a bytes.Buffer).
+	mu sync.Mutex
 }
 
 type dumpTask struct {
@@ -160,7 +167,9 @@ func (d *Dumper) DumpTo(p []byte, output io.Writer) {
 		d.ch <- &dumpTask{Data: b, Output: output}
 		return
 	}
+	d.mu.Lock()
 	output.Write(p)
+	d.mu.Unlock()
 }
 
 func (d *Dumper) DumpDefault(p []byte) {
