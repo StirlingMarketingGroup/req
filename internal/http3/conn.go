@@ -29,6 +29,19 @@ var errGoAway = errors.New("connection in graceful shutdown")
 // invalidStreamID is a stream ID that is invalid. The first valid stream ID in QUIC is 0.
 const invalidStreamID = quic.StreamID(-1)
 
+// ConnectionTracingID is a unique identifier for an HTTP/3 connection, passed to the
+// stream hijacker callbacks. quic-go exposed an equivalent value through the connection
+// context (quic.ConnectionTracingKey) up to v0.57.x but removed it in v0.59.0, so req
+// now assigns and tracks the ID itself.
+type ConnectionTracingID uint64
+
+var connectionTracingIDCounter atomic.Uint64
+
+// nextConnectionTracingID returns a new, unique ConnectionTracingID.
+func nextConnectionTracingID() ConnectionTracingID {
+	return ConnectionTracingID(connectionTracingIDCounter.Add(1))
+}
+
 // Conn is an HTTP/3 connection.
 // It has all methods from the quic.Conn expect for AcceptStream, AcceptUniStream,
 // SendDatagram and ReceiveDatagram.
@@ -55,6 +68,8 @@ type Conn struct {
 
 	idleTimeout time.Duration
 	idleTimer   *time.Timer
+
+	tracingID ConnectionTracingID
 
 	qlogger qlogwriter.Recorder
 }
@@ -85,6 +100,7 @@ func newConnection(
 		streams:          make(map[quic.StreamID]*stateTrackingStream),
 		maxStreamID:      InvalidStreamID,
 		lastStreamID:     InvalidStreamID,
+		tracingID:        nextConnectionTracingID(),
 		qlogger:          qlogger,
 	}
 	if idleTimeout > 0 {
@@ -232,7 +248,7 @@ func (c *Conn) CloseWithError(code quic.ApplicationErrorCode, msg string) error 
 	return c.conn.CloseWithError(code, msg)
 }
 
-func (c *Conn) handleUnidirectionalStreams(hijack func(StreamType, quic.ConnectionTracingID, *quic.ReceiveStream, error) (hijacked bool)) {
+func (c *Conn) handleUnidirectionalStreams(hijack func(StreamType, ConnectionTracingID, *quic.ReceiveStream, error) (hijacked bool)) {
 	var (
 		rcvdControlStr      atomic.Bool
 		rcvdQPACKEncoderStr atomic.Bool
@@ -251,7 +267,7 @@ func (c *Conn) handleUnidirectionalStreams(hijack func(StreamType, quic.Connecti
 		go func(str *quic.ReceiveStream) {
 			streamType, err := quicvarint.Read(quicvarint.NewReader(str))
 			if err != nil {
-				id := c.Context().Value(quic.ConnectionTracingKey).(quic.ConnectionTracingID)
+				id := c.tracingID
 				if hijack != nil && hijack(StreamType(streamType), id, str, err) {
 					return
 				}
@@ -288,7 +304,7 @@ func (c *Conn) handleUnidirectionalStreams(hijack func(StreamType, quic.Connecti
 				if hijack != nil {
 					if hijack(
 						StreamType(streamType),
-						c.Context().Value(quic.ConnectionTracingKey).(quic.ConnectionTracingID),
+						c.tracingID,
 						str,
 						nil,
 					) {
@@ -335,7 +351,7 @@ func (c *Conn) handleControlStream(str *quic.ReceiveStream) {
 		// If datagram support was enabled on our side as well as on the server side,
 		// we can expect it to have been negotiated both on the transport and on the HTTP/3 layer.
 		// Note: ConnectionState() will block until the handshake is complete (relevant when using 0-RTT).
-		if c.enableDatagrams && !c.ConnectionState().SupportsDatagrams {
+		if c.enableDatagrams && !c.ConnectionState().SupportsDatagrams.Remote {
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeSettingsError), "missing QUIC Datagram support")
 			return
 		}
